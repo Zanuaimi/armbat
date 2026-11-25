@@ -23,7 +23,7 @@ nothing is patched and nothing is installed.
 |---|---|
 | Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| Every build and changelog | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
+| Every build and changelog | [armbat.netlify.app](https://armbat.netlify.app/builds) |
 
 The app can also switch between the two channels in its settings.
 
@@ -38,6 +38,9 @@ The app can also switch between the two channels in its settings.
 - Audio goes through OpenSLES.
 - Saves, settings and expansion files live in `/sdcard/armbat/`, so a save can be
   copied in before the first launch and backed up later.
+- An expansion file or a cache archive is picked in the launcher and placed where
+  the game looks for it, without a file manager
+  ([guides/game-data.md](guides/game-data.md)).
 - A game that ships a protection SDK and refuses its own environment can be told
   to skip it, per app ([guides/silence.md](guides/silence.md)).
 
@@ -111,6 +114,11 @@ Data can be put in place before the first launch: these directories are created
 when the archive is imported, and again whenever the guest asks for one. An obb
 only has to be copied into `android/obb/<package>/`, a save into `files/` or
 `external/files/`.
+
+The dock has a second import for exactly those two files: an `.obb` or a `.zip`
+picked there is placed by the container itself, and the `.obb` is renamed to the
+version code the game will look up. Details and the four destinations are in
+[guides/game-data.md](guides/game-data.md).
 
 Without "all files access" the folder cannot be read and the library stays empty
 until the grant is given.
