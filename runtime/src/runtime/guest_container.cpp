@@ -51,6 +51,7 @@
 #include "guest_unwind.h"
 #include "guest_attach.h"
 #include "armbat/jni_bridge.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -727,6 +728,11 @@ struct GuestContainer::Impl {
     // The slots are numbered in advance anyway, so the next few machines are
     // built at startup and parked where a recycled one is looked for.
     void PrewarmMachines() {
+        // Three machines are what the guest needs to get moving; the rest of the
+        // pool is filled by SpareBuilderLoop while the guest boots. Building more
+        // than this here was measured: sixteen machines up front cost 67 ms of
+        // wall time on the main thread and saved two builds later, so the pool
+        // floor (kSpareTarget) is where a bigger pool belongs, not here.
         constexpr std::uint32_t kPrewarm = 3;
         std::vector<std::uint32_t> processors;
         {
@@ -1255,7 +1261,7 @@ struct GuestContainer::Impl {
     // alive for as long as their thread runs, and the entry is dropped when the
     // thread exits so that the JIT code cache of a dead thread is released with
     // it.
-    std::mutex spawned_mutex;
+    ARMBAT_LOCKABLE(std::mutex, spawned_mutex);
     std::vector<std::shared_ptr<A32Machine>> spawned;
     std::atomic<std::uint32_t> next_processor_id{1};
     // Exclusive-monitor slots of threads that have exited. Every guest thread
@@ -1278,7 +1284,13 @@ struct GuestContainer::Impl {
     // of milliseconds, and the guest asks for threads in bursts: the pool is
     // refilled while nothing waits for it, so a burst finds machines instead of
     // paying for one per thread.
-    static constexpr std::size_t kSpareTarget = 3;
+    //
+    // Measured: the guest's first burst creates thirteen threads inside 120 ms,
+    // and with a floor of three every thread past the third paid 8-13 ms for a
+    // machine on the thread that asked for it. The builder has more than a
+    // second of idle time before that burst, so a higher floor costs nothing but
+    // address space and removes those builds from the guest's clock.
+    static constexpr std::size_t kSpareTarget = 16;
     std::thread spare_builder;
     std::atomic<bool> spare_stop{false};
     // A processor id is the index at which the exclusive monitor keeps that
@@ -1314,7 +1326,7 @@ struct GuestContainer::Impl {
     // would lose it between two calls.
     std::uint32_t contexts_addr = 0;
     int context_count = 0;
-    std::mutex context_mutex;
+    ARMBAT_LOCKABLE(std::mutex, context_mutex);
     // Slots that are free to lend. A platform thread takes one on its first
     // native call and hands it back when it exits: ART keeps a pool of Java
     // threads and drops them as the pool shrinks, and a context that a dead

@@ -38,6 +38,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 import kotlin.math.min
 
@@ -145,6 +146,19 @@ class GuestLauncher(private val host: Activity) {
         private val startGuest: (Intent) -> Boolean,
     ) : ContextWrapper(base) {
         private var guestTheme: Resources.Theme? = null
+
+        /**
+         * The Application of this guest process, once it exists.
+         *
+         * On a device getApplicationContext() answers with the Application
+         * itself, whatever context of the process it is asked on. The base
+         * context has to exist before the Application is created, so this
+         * stays unset until guestApplication below publishes it.
+         */
+        var guestApplication: Application? = null
+
+        /** One line per call and target: a retry loop must not flood the log. */
+        private val refusedServiceCalls: MutableSet<String> = ConcurrentHashMap.newKeySet<String>()
 
         /**
          * Package queries from a guest describe the archive, not the container:
@@ -321,8 +335,15 @@ class GuestLauncher(private val host: Activity) {
          * The application context of a guest has to resolve the archive's
          * resources: SDKs inflate their own layouts and read their own strings
          * through it, and the container's resources do not contain those ids.
+         *
+         * It is the archive's Application, as on a device: code that keeps
+         * process-wide state behind an `instanceof Application` check (the
+         * playmods launcher of Slendytubbies does this in its own onCreate)
+         * otherwise never initializes and dereferences a null singleton on
+         * the first lifecycle callback. The Application is attached to this
+         * context, so resources and package answers are still the archive's.
          */
-        override fun getApplicationContext(): Context = this
+        override fun getApplicationContext(): Context = guestApplication ?: this
 
         /**
          * A cloned inflater, so layouts referenced by the archive's ids are
@@ -503,49 +524,55 @@ class GuestLauncher(private val host: Activity) {
             super.getSharedPreferences(name, legacyMode(mode))
 
         /**
-         * The container presents a device without Google services: nothing in it
-         * ships the Play Store, Play services or the licensing service, and the
-         * guest has to take the same "store unavailable" path it takes on such a
-         * device. On a phone that happens to have them installed the guest would
-         * otherwise connect to the real billing service and run a code path no
-         * offline container can support.
+         * The services a guest addresses do not exist on the device it is
+         * presented with.
+         *
+         * That device has one package -- the archive -- and the archive is not
+         * installed, so the platform never instantiates a Service its manifest
+         * declares, and the container does not run one. The call must not be
+         * handed to the phone either: a component of the phone's own would
+         * start an application the guest is not allowed to see, while an intent
+         * that names no package at all is rejected by the platform since API 21
+         * with IllegalArgumentException ("Service Intent must be explicit").
+         * EA's push helper starts com.google.android.c2dm.intent.REGISTER with
+         * an action alone, and that exception on the guest's main thread ends
+         * the process before the game appears.
+         *
+         * The answer is the one such a device gave when nothing installed
+         * matched the intent: nothing starts, and the caller receives the
+         * null/false of a missing service and carries on.
          */
-        private fun isUnavailableService(service: Intent): Boolean {
-            // The billing helper binds with an implicit intent (no package), so
-            // the action has to be checked as well as an explicit package name.
-            val packageName = service.`package`
-            if (packageName != null) {
-                if (packageName == "com.android.vending" ||
-                    packageName == "com.google.android.gms" ||
-                    packageName == "com.google.android.gsf" ||
-                    packageName == "com.google.android.gms.phenotype" ||
-                    packageName == "com.bda.controller"
-                ) {
-                    return true
-                }
+        private fun refuseService(call: String, service: Intent) {
+            val component = service.component
+            val target = component?.let { "${it.packageName}/${it.className}" }
+                ?: service.`package`
+                ?: service.action
+                ?: "service"
+            if (!refusedServiceCalls.add("$call $target")) {
+                return
             }
-            val action = service.action ?: return false
-            return action.startsWith("com.android.vending.") ||
-                action.startsWith("com.google.android.gms.") ||
-                action.startsWith("com.google.android.finsky.") ||
-                action == "com.bda.controller.IControllerService" ||
-                action.startsWith("com.bda.controller.")
+            ArmbatLog.i(TAG, "$call refused: $target is not part of this device")
         }
 
         override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean {
-            if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "bindService refused: ${service.`package` ?: service.action} is not part of this device")
-                return false
-            }
-            return super.bindService(service, conn, flags)
+            refuseService("bindService", service)
+            return false
         }
 
         override fun startService(service: Intent): ComponentName? {
-            if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
-                return null
-            }
-            return super.startService(service)
+            refuseService("startService", service)
+            return null
+        }
+
+        /** A newer archive asks for a foreground service by a call of its own. */
+        override fun startForegroundService(service: Intent): ComponentName? {
+            refuseService("startForegroundService", service)
+            return null
+        }
+
+        override fun stopService(service: Intent): Boolean {
+            refuseService("stopService", service)
+            return false
         }
 
         /**
@@ -701,6 +728,7 @@ class GuestLauncher(private val host: Activity) {
         }
 
         private var forwarding = false
+        private var touchReported = false
 
         override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
             // This frame is the guest's window: the one place an event enters
@@ -713,6 +741,12 @@ class GuestLauncher(private val host: Activity) {
                     // The letterbox belongs to no window of the guest; a gesture
                     // begun there must not reach it.
                     return false
+                }
+                if (!touchReported) {
+                    // One line per launch: a guest that ignores its touches is
+                    // diagnosed from the mapping, not from a screenshot.
+                    touchReported = true
+                    ArmbatLog.i(TAG, "input: first touch host ${ev.x},${ev.y} guest $x,$y")
                 }
             } else if (!forwarding) {
                 // Only a gesture this frame started belongs to the activity: a
@@ -731,7 +765,16 @@ class GuestLauncher(private val host: Activity) {
                 // only with the event it dispatches back itself. An activity
                 // that took no queue is an ordinary Java window: the event goes
                 // to it and it hands the event to its views.
-                GuestNatives.touch(scaled) || guest.dispatchTouchEvent(scaled)
+                if (GuestNatives.touch(scaled)) {
+                    true
+                } else {
+                    val java = withGuestRawCoordinates(scaled)
+                    try {
+                        guest.dispatchTouchEvent(java)
+                    } finally {
+                        java.recycle()
+                    }
+                }
             } finally {
                 scaled.recycle()
             }
@@ -742,6 +785,44 @@ class GuestLauncher(private val host: Activity) {
             forwarding = ev.actionMasked != MotionEvent.ACTION_UP &&
                 ev.actionMasked != MotionEvent.ACTION_CANCEL
             return handled || forwarding
+        }
+
+        /**
+         * The same event with its raw coordinates in the guest's pixels.
+         *
+         * MotionEvent.transform() moves the points into the guest's space but
+         * deliberately leaves getRawX()/getRawY() in the space of the device's
+         * display. An engine of the 2.x era compares that pair with the screen
+         * size it read from the display and hit-tests with it -- Doodle Jump
+         * reads nothing but the raw pair -- so with the phone's coordinates
+         * every touch landed outside the guest's screen. A rebuilt event has
+         * no raw offset, which is what a full-screen window sees on a device,
+         * and keeps the pointer ids, pressure, flags and history a guest may
+         * read.
+         */
+        private fun withGuestRawCoordinates(ev: MotionEvent): MotionEvent {
+            val count = ev.pointerCount
+            val properties = Array(count) { MotionEvent.PointerProperties() }
+            val current = Array(count) { MotionEvent.PointerCoords() }
+            for (index in 0 until count) {
+                ev.getPointerProperties(index, properties[index])
+                ev.getPointerCoords(index, current[index])
+            }
+            val event = MotionEvent.obtain(
+                ev.downTime, ev.eventTime, ev.action, count, properties, current,
+                ev.metaState, ev.buttonState, ev.xPrecision, ev.yPrecision,
+                ev.deviceId, ev.edgeFlags, ev.source, ev.flags,
+            )
+            if (ev.historySize > 0) {
+                val history = Array(count) { MotionEvent.PointerCoords() }
+                for (position in 0 until ev.historySize) {
+                    for (index in 0 until count) {
+                        ev.getHistoricalPointerCoords(index, position, history[index])
+                    }
+                    event.addBatch(ev.getHistoricalEventTime(position), history, ev.metaState)
+                }
+            }
+            return event
         }
     }
 
@@ -764,9 +845,25 @@ class GuestLauncher(private val host: Activity) {
         var started = false
         var resumed = false
 
+        /** The window focus the activity and its views were last told about. */
+        var windowFocused = false
+
+        /** A focus was due while the window was not on screen yet (see settle). */
+        var focusPending = false
+
         /** The archive called finish(); the result still has to be handed back. */
         var finished = false
         var destroyed = false
+
+        /**
+         * The result the archive had set when it called finish().
+         *
+         * The platform records the result at that moment, so a setResult() from
+         * onDestroy never reaches the caller: it only matters here because the
+         * activity is destroyed before the result is delivered.
+         */
+        var resultCode = Activity.RESULT_CANCELED
+        var resultData: Intent? = null
     }
 
     /** One request the archive made about its own activities. */
@@ -1579,6 +1676,17 @@ class GuestLauncher(private val host: Activity) {
             androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         this.hosted = hosted
         ArmbatLog.i(TAG, "guest activity shown: ${hosted.info.name}")
+        if (hosted.focusPending) {
+            // The window is on screen now, so the focus that was withheld can
+            // be reported (see windowFocus). It is posted rather than delivered
+            // here because the platform reports the focus of a window after its
+            // first traversal, not in the middle of adding it.
+            frame.post {
+                if (hosted.focusPending && hosted.resumed && this.hosted === hosted) {
+                    windowFocus(hosted, true)
+                }
+            }
+        }
     }
 
     /**
@@ -1648,7 +1756,20 @@ class GuestLauncher(private val host: Activity) {
      * can let the platform handle its own children.
      */
     fun finishGuestActivity(activity: Activity): Boolean {
-        val hosted = session?.stack?.firstOrNull { it.activity === activity } ?: return false
+        val hosted = session?.stack?.firstOrNull { it.activity === activity }
+        if (hosted == null) {
+            // A finish from one of the archive's own activities belongs to the
+            // archive even when that activity is already gone — the archive calls
+            // finish() from its own onDestroy, right after the container destroyed
+            // it. Answering false hands the child to the platform, and the
+            // platform finishes this activity, which ends the whole session.
+            val prepared = session?.prepared
+            if (prepared != null && activity.javaClass.classLoader === prepared.loader) {
+                ArmbatLog.i(TAG, "guest finish: ${activity.javaClass.name} already gone")
+                return true
+            }
+            return false
+        }
         if (hosted.finished) {
             return true
         }
@@ -1656,6 +1777,8 @@ class GuestLauncher(private val host: Activity) {
         // Activity.isFinishing reads this field, and the platform would have set
         // it: an archive that checks it after finish() has to see the truth.
         optional(hosted.activity, "mFinished", true)
+        hosted.resultCode = resultCode(hosted.activity)
+        hosted.resultData = resultData(hosted.activity)
         request(Action.Finish(hosted))
         return true
     }
@@ -1727,8 +1850,10 @@ class GuestLauncher(private val host: Activity) {
         if (requestCode < 0) {
             return
         }
-        val code = resultCode(finished.activity)
-        val data = resultData(finished.activity)
+        // The activity is destroyed by the time the result is delivered, so the
+        // result recorded when it called finish() is the one to hand back.
+        val code = finished.resultCode
+        val data = finished.resultData
         runCatching {
             val method = Activity::class.java.getDeclaredMethod(
                 "onActivityResult",
@@ -2082,7 +2207,39 @@ class GuestLauncher(private val host: Activity) {
      * The guest's window is the host's window, and the guest's decor is only a
      * view inside it, so nothing would ever call this on the archive. An archive
      * may depend on it completely: Unity's activity forwards it to its player,
-     * which is where the engine is told to resume rendering.
+     * which is where the engine is told to resume rendering. Only the changes
+     * are reported, as the platform reports them: the guest is never told it
+     * lost a focus it never had.
+     */
+    private fun windowFocus(hosted: Hosted, hasFocus: Boolean) {
+        if (!hasFocus) {
+            hosted.focusPending = false
+            if (!hosted.windowFocused) {
+                return
+            }
+            dispatchWindowFocus(hosted, false)
+            return
+        }
+        if (hosted.windowFocused) {
+            return
+        }
+        // The platform reports the focus of a window that is on screen, and the
+        // guest's decor may not be there yet: an archive that starts another
+        // activity from its own onCreate is resumed and then covered by the
+        // container before settle() ever puts its frame into the host, and the
+        // platform never shows that window at all. Handing its views a focus
+        // gain and a focus loss in that state arms engines that resume from the
+        // second event: N.O.V.A. 3's renderer then calls GameResume() on its
+        // first frame, before the engine has built its subsystems, and faults
+        // on the null VoiceChat singleton. The focus waits for settle().
+        if (!dispatchWindowFocus(hosted, true)) {
+            hosted.focusPending = true
+            ArmbatLog.i(TAG, "window focus: ${hosted.info.name} waits for its window")
+        }
+    }
+
+    /**
+     * Tells the guest's activity and the decor's children about the focus.
      *
      * The archive's views need the same event. On a device the window's root
      * calls dispatchWindowFocusChanged on the decor: the decor's own handler
@@ -2095,8 +2252,16 @@ class GuestLauncher(private val host: Activity) {
      * black until the host lost the focus and got it back. The decor's
      * children are dispatched to, in the platform's order after the activity,
      * and not the decor itself, which would call the activity a second time.
+     *
+     * A gain is refused while the decor is not attached to a window, because
+     * the platform never delivers one in that state; a loss always goes out.
+     * Returns false when the gain was refused.
      */
-    private fun windowFocus(hosted: Hosted, hasFocus: Boolean) {
+    private fun dispatchWindowFocus(hosted: Hosted, hasFocus: Boolean): Boolean {
+        val decor = hosted.window.peekDecorView() as? ViewGroup
+        if (hasFocus && (decor == null || !decor.isAttachedToWindow)) {
+            return false
+        }
         try {
             val method = Activity::class.java.getDeclaredMethod(
                 "onWindowFocusChanged",
@@ -2108,7 +2273,10 @@ class GuestLauncher(private val host: Activity) {
         } catch (error: Throwable) {
             ArmbatLog.i(TAG, "window focus: $hasFocus failed: ${error.cause ?: error}")
         }
-        val decor = hosted.window.peekDecorView() as? ViewGroup ?: return
+        hosted.windowFocused = hasFocus
+        if (decor == null) {
+            return true
+        }
         for (index in 0 until decor.childCount) {
             val view = decor.getChildAt(index)
             try {
@@ -2117,6 +2285,7 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "window focus: $hasFocus to ${view.javaClass.name} failed: $error")
             }
         }
+        return true
     }
 
     /**
@@ -2467,7 +2636,7 @@ class GuestLauncher(private val host: Activity) {
      * TelephonyManager, and the archive's cast to the guest class of that name
      * fails before its activity has started.
      */
-    private fun guestApplication(prepared: Prepared, context: Context): Application {
+    private fun guestApplication(prepared: Prepared, context: GuestContext): Application {
         val className = prepared.archiveInfo?.className
         val application = if (className.isNullOrEmpty()) {
             Application()
@@ -2488,6 +2657,9 @@ class GuestLauncher(private val host: Activity) {
         // What Application.attach does before onCreate: the base context is
         // where getPackageName, getResources and getContentResolver answer from.
         attachBaseContext(application, context)
+        // The platform answers getApplicationContext() with the Application
+        // from inside its own onCreate as well, so publish it before that call.
+        context.guestApplication = application
         application.onCreate()
         return application
     }
